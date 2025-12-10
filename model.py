@@ -7,6 +7,7 @@ sampling loop) around a UNet1DModel from huggingface-diffusers.
 from __future__ import annotations
 
 import math
+import inspect
 from typing import Iterable, Literal, Sequence, Tuple
 
 import torch
@@ -82,7 +83,9 @@ class TimeSeriesDDPM(nn.Module):
         if down_block_types is None or up_block_types is None:
             down_block_types, up_block_types = _default_block_types(n_blocks)
 
-        self.unet = UNet1DModel(
+        # diffusers UNet1DModel signature varies across versions; only pass supported args.
+        unet_sig = inspect.signature(UNet1DModel.__init__).parameters
+        kwargs = dict(
             sample_size=sample_size,
             in_channels=in_channels,
             out_channels=in_channels,
@@ -92,8 +95,11 @@ class TimeSeriesDDPM(nn.Module):
             up_block_types=tuple(up_block_types),
             norm_num_groups=norm_num_groups,
             act_fn=act_fn,
-            dropout=dropout,
         )
+        if "dropout" in unet_sig:
+            kwargs["dropout"] = dropout
+
+        self.unet = UNet1DModel(**kwargs)
 
         betas = make_beta_schedule(num_train_timesteps, beta_schedule)
         alphas = 1.0 - betas
