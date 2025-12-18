@@ -1,5 +1,4 @@
 torch
-diffusers
 numpy
 POT
 tqdm

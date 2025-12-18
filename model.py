@@ -1,25 +1,15 @@
-"""Time-series DDPM built on diffusers' 1D UNet.
-
-This module implements the core DDPM math (noise schedule, training loss,
-sampling loop) around a UNet1DModel from huggingface-diffusers.
-"""
+"""Time-series DDPM built on a custom FiLM-conditioned 1D MLP."""
 
 from __future__ import annotations
 
 import math
-import inspect
-from typing import Iterable, Literal, Sequence, Tuple
+from typing import Iterable, Literal, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    # Recent diffusers
-    from diffusers import UNet1DModel
-except ImportError:  # pragma: no cover - older diffusers naming
-    from diffusers import Unet1dModel as UNet1DModel
-
+from mlp import MLP1DModel
 
 
 BetaSchedule = Literal["cosine", "sigmoid"]
@@ -52,24 +42,24 @@ def make_beta_schedule(num_steps: int, schedule: BetaSchedule = "cosine") -> tor
     raise ValueError(f"Unknown beta schedule: {schedule}")
 
 
-def _default_block_types(n_blocks: int) -> Tuple[str, ...]:
-    # DownBlock1D / UpBlock1D mirror pairs for a vanilla UNet1DModel.
-    return tuple(["DownBlock1D"] * n_blocks), tuple(["UpBlock1D"] * n_blocks)
-
-
 class TimeSeriesDDPM(nn.Module):
-    """DDPM for 1D time-series built around diffusers' UNet1DModel."""
+    """DDPM for 1D time-series using a custom MLP backbone."""
 
     def __init__(
         self,
         sample_size: int,
         in_channels: int = 1,
+        beta_schedule: BetaSchedule = "cosine",
+        num_train_timesteps: int = 1000,
+        d_model: int | None = 256,
+        d_mlp: int | None = None,
+        num_layers: int | None = 6,
+        dropout: float = 0.1,
+        time_embed_dim: int | None = None,
+        # Legacy UNet args kept for backward compatibility; ignored beyond mapping defaults.
         base_channels: int = 64,
         channel_mults: Sequence[int] | None = (1, 2, 4, 8),
         layers_per_block: int = 2,
-        beta_schedule: BetaSchedule = "cosine",
-        num_train_timesteps: int = 1000,
-        dropout: float = 0.1,
         act_fn: str = "silu",
         norm_num_groups: int = 32,
         down_block_types: Iterable[str] | None = None,
@@ -77,29 +67,22 @@ class TimeSeriesDDPM(nn.Module):
     ) -> None:
         super().__init__()
 
-        block_out_channels = tuple(base_channels * m for m in channel_mults or (1, 2, 4, 8))
-        n_blocks = len(block_out_channels)
+        d_model = d_model if d_model is not None else base_channels
+        d_mlp = d_mlp if d_mlp is not None else d_model * 2
+        if num_layers is None:
+            depth_hint = len(channel_mults) if channel_mults is not None else 0
+            num_layers = max(depth_hint * layers_per_block, 1)
 
-        if down_block_types is None or up_block_types is None:
-            down_block_types, up_block_types = _default_block_types(n_blocks)
-
-        # diffusers UNet1DModel signature varies across versions; only pass supported args.
-        unet_sig = inspect.signature(UNet1DModel.__init__).parameters
-        kwargs = dict(
+        self.unet = MLP1DModel(
             sample_size=sample_size,
             in_channels=in_channels,
             out_channels=in_channels,
-            layers_per_block=layers_per_block,
-            block_out_channels=block_out_channels,
-            down_block_types=tuple(down_block_types),
-            up_block_types=tuple(up_block_types),
-            norm_num_groups=norm_num_groups,
-            act_fn=act_fn,
+            d_model=d_model,
+            d_mlp=d_mlp,
+            num_layers=num_layers,
+            dropout=dropout,
+            time_embed_dim=time_embed_dim,
         )
-        if "dropout" in unet_sig:
-            kwargs["dropout"] = dropout
-
-        self.unet = UNet1DModel(**kwargs)
 
         betas = make_beta_schedule(num_train_timesteps, beta_schedule)
         alphas = 1.0 - betas
@@ -209,3 +192,4 @@ __all__ = [
     "cosine_beta_schedule",
     "sigmoid_beta_schedule",
 ]
+

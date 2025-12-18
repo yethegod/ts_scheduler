@@ -55,15 +55,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-size", type=int, default=128, help="Number of points per sine wave.")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size.")
     parser.add_argument("--epochs", type=int, default=50, help="Training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--base-channels", type=int, default=32, help="UNet base channels.")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
+    parser.add_argument("--d-model", type=int, default=256, help="Hidden size of the MLP backbone.")
     parser.add_argument(
-        "--channel-mults",
+        "--d-mlp",
         type=int,
-        nargs="+",
-        default=[1, 2, 4],
-        help="Channel multipliers for UNet blocks.",
+        default=None,
+        help="Hidden size of the MLP feedforward; default is 2 * d_model.",
     )
+    parser.add_argument("--num-layers", type=int, default=6, help="Number of FiLM MLP blocks.")
+    parser.add_argument("--dropout", type=float, default=0.05, help="Dropout rate in MLP blocks.")
+    parser.add_argument("--time-embed-dim", type=int, default=None, help="Timestep embedding dimension.")
     parser.add_argument(
         "--diffusion-steps", type=int, default=400, help="Number of diffusion timesteps for training."
     )
@@ -178,6 +180,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"Using device: {device}")
 
+    data_device = torch.device("cpu")  # keep dataset on CPU; move per-batch during training
     data = make_sine_dataset(
         num_samples=args.num_samples,
         sample_size=args.sample_size,
@@ -185,16 +188,19 @@ def main() -> None:
         freq_range=tuple(args.freq_range),
         phase_range=tuple(args.phase_range),
         noise_std=args.noise_std,
-        device=device,
+        device=data_device,
     )
     dataloader = get_dataloader(data, batch_size=args.batch_size, num_workers=args.num_workers)
 
     model = TimeSeriesDDPM(
         sample_size=args.sample_size,
         in_channels=1,
-        base_channels=args.base_channels,
-        channel_mults=tuple(args.channel_mults),
         num_train_timesteps=args.diffusion_steps,
+        d_model=args.d_model,
+        d_mlp=args.d_mlp,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        time_embed_dim=args.time_embed_dim,
     ).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
 
