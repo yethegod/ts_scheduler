@@ -1,44 +1,48 @@
-"""Train a simple TimeSeriesDDPM on synthetic sine waves and report sliced Wasserstein distance."""
+"""Train a simple TimeSeriesDDPM on synthetic RBF-kernel data and report sliced Wasserstein distance."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
 from evaluation import WassersteinDistances
 from model import TimeSeriesDDPM
 
 
-def make_sine_dataset(
+def make_rbf_dataset(
     num_samples: int,
     sample_size: int,
-    amplitude_range: Tuple[float, float] = (1.0, 1.0),
-    freq_range: Tuple[float, float] = (1.0, 1.0),
-    phase_range: Tuple[float, float] = (0.0, 2 * math.pi),
+    lengthscale: float = 8, # 2
+    variance: float = 1.0,
     noise_std: float = 0.0,
+    jitter: float = 1e-6,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    """Create a batch of sine waves of shape (num_samples, 1, sample_size)."""
+    """Create a batch of RBF-kernel samples of shape (num_samples, 1, sample_size)."""
     if device is None:
         device = torch.device("cpu")
-    t = torch.linspace(0, 2 * math.pi, sample_size, device=device, dtype=torch.float32)
-    t = t.unsqueeze(0).repeat(num_samples, 1)
+    if lengthscale <= 0:
+        raise ValueError("lengthscale must be positive for the RBF kernel.")
+    if variance <= 0:
+        raise ValueError("variance must be positive for the RBF kernel.")
 
-    amp = torch.empty(num_samples, 1, device=device).uniform_(*amplitude_range)
-    freq = torch.empty(num_samples, 1, device=device).uniform_(*freq_range)
-    phase = torch.empty(num_samples, 1, device=device).uniform_(*phase_range)
-
-    waves = amp * torch.sin(freq * t + phase)
+    x = torch.linspace(0.0, 1.0, sample_size, device=device, dtype=torch.float32)
+    diff = x.unsqueeze(0) - x.unsqueeze(1)
+    sq_dist = diff.pow(2)
+    kernel = variance * torch.exp(-0.5 * sq_dist / (lengthscale**2))
+    if jitter > 0:
+        kernel = kernel + torch.eye(sample_size, device=device, dtype=torch.float32) * jitter
+    chol = torch.linalg.cholesky(kernel)
+    samples = torch.randn(num_samples, sample_size, device=device) @ chol.T
     if noise_std > 0:
-        waves = waves + torch.randn_like(waves) * noise_std
-    return waves.unsqueeze(1)
+        samples = samples + torch.randn_like(samples) * noise_std
+    return samples.unsqueeze(1)
 
 
 def get_dataloader(
@@ -49,13 +53,13 @@ def get_dataloader(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train DDPM on sine curves.")
+    parser = argparse.ArgumentParser(description="Train DDPM on RBF-kernel synthetic data.")
     parser.add_argument("--num-samples", type=int, default=2048, help="Number of training samples.")
-    parser.add_argument("--eval-samples", type=int, default=512, help="Number of samples to draw for evaluation.")
-    parser.add_argument("--sample-size", type=int, default=128, help="Number of points per sine wave.")
+    parser.add_argument("--eval-samples", type=int, default=256, help="Number of samples to draw for evaluation.")
+    parser.add_argument("--sample-size", type=int, default=128, help="Number of points per sequence.")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size.")
     parser.add_argument("--epochs", type=int, default=50, help="Training epochs.")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--d-model", type=int, default=256, help="Hidden size of the MLP backbone.")
     parser.add_argument(
         "--d-mlp",
@@ -69,28 +73,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-steps", type=int, default=400, help="Number of diffusion timesteps for training."
     )
-    parser.add_argument("--noise-std", type=float, default=0.0, help="Gaussian noise added to sine data.")
     parser.add_argument(
-        "--amplitude-range",
+        "--rbf-lengthscale",
         type=float,
-        nargs=2,
-        default=[1.0, 1.0],
-        help="Uniform range for sine amplitudes.",
+        default=0.2,
+        help="Lengthscale for the RBF kernel (x in [0, 1]).",
     )
     parser.add_argument(
-        "--freq-range",
+        "--rbf-variance",
         type=float,
-        nargs=2,
-        default=[1.0, 1.0],
-        help="Uniform range for sine frequencies.",
+        default=1.0,
+        help="Variance scale for the RBF kernel.",
     )
     parser.add_argument(
-        "--phase-range",
+        "--rbf-jitter",
         type=float,
-        nargs=2,
-        default=[0.0, 2 * math.pi],
-        help="Uniform range for sine phases.",
+        default=1e-6,
+        help="Diagonal jitter for stable Cholesky of the RBF kernel.",
     )
+    parser.add_argument("--noise-std", type=float, default=0.0, help="Gaussian noise added to RBF data.")
     parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available.")
@@ -181,13 +182,13 @@ def main() -> None:
     print(f"Using device: {device}")
 
     data_device = torch.device("cpu")  # keep dataset on CPU; move per-batch during training
-    data = make_sine_dataset(
+    data = make_rbf_dataset(
         num_samples=args.num_samples,
         sample_size=args.sample_size,
-        amplitude_range=tuple(args.amplitude_range),
-        freq_range=tuple(args.freq_range),
-        phase_range=tuple(args.phase_range),
+        lengthscale=args.rbf_lengthscale,
+        variance=args.rbf_variance,
         noise_std=args.noise_std,
+        jitter=args.rbf_jitter,
         device=data_device,
     )
     dataloader = get_dataloader(data, batch_size=args.batch_size, num_workers=args.num_workers)
@@ -217,6 +218,8 @@ def main() -> None:
     model.eval()
     with torch.no_grad():
         generated = model.sample(num_samples=args.eval_samples, device=device)
+    torch.save(generated.cpu(), "samples.pt")
+    print("Saved generated samples to samples.pt")
     _ = evaluate_swd(
         real=data[: args.eval_samples],
         generated=generated,
@@ -225,6 +228,22 @@ def main() -> None:
         seed=args.seed,
         metric_path=args.metric_path,
     )
+
+    # Plot and save a few generated sequences for quick inspection.
+    samples_to_plot = min(3, generated.size(0))
+    xs = torch.arange(generated.size(-1)).cpu().numpy()
+    fig, axes = plt.subplots(samples_to_plot, 1, figsize=(8, 2.5 * samples_to_plot), sharex=True)
+    if samples_to_plot == 1:
+        axes = [axes]
+    for i in range(samples_to_plot):
+        axes[i].plot(xs, generated[i, 0].detach().cpu().numpy())
+        axes[i].set_title(f"Generated sample {i}")
+    axes[-1].set_xlabel("Time index")
+    fig.tight_layout()
+    plot_path = Path("generated_samples.png")
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved generated samples plot to {plot_path}")
 
 
 if __name__ == "__main__":
